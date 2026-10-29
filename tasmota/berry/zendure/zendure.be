@@ -7,6 +7,12 @@
 # injection detection with fallback to a safe state. Discharge is also cut when the ZLinky
 # goes silent, since export detection is blind without it.
 #
+# Auto mode (default on, `ZenConfig {"auto":0}` to disable): whenever no cloud plan is
+# active - never received, expired, or cloud silent - the gateway runs a local strategy
+# instead of idling: charge at max during off-peak hours (tariff read from the ZLinky,
+# capped to stay under the subscribed power), otherwise discharge following house
+# consumption so the grid import settles just above zero. A valid cloud plan always wins.
+#
 # CONFIRM-ON-FIRST-DEPLOY: the exact JSON key names for live SoC/temperature/power inside
 # `properties`/`packData` were not given by the spec (only the write-side limit properties
 # were verified: acMode, inputLimit, outputLimit, smartMode, minSoc, socSet, gridReverse,
@@ -43,6 +49,23 @@ var ZEN_INJECTION_WINDOW_MS = 10 * 60 * 1000   # spec §4.5bis
 var ZEN_MISMATCH_LIMIT = 3            # spec §4.6
 var ZEN_METER_STALE_MS = 60 * 1000    # ZLinky is polled every 10s - 60s of silence means the meter is gone
 
+# --- Auto mode (local strategy when no cloud plan is active) ----------------------------
+var ZEN_AUTO_TARGET_VA    = 50     # discharge: grid import to settle at, just above zero
+var ZEN_AUTO_DEADBAND_VA  = 30     # must stay below the target, or a 0 reading (export) is ignored
+var ZEN_AUTO_DOWN_STEP_W  = 100    # meter reads 0 when exporting - the excess is unknown: halve, at least this much
+var ZEN_AUTO_MAX_OUT_W    = 800
+var ZEN_AUTO_MAX_IN_W     = 2400
+var ZEN_AUTO_IN_DEADBAND_W = 100   # charge setpoint changes smaller than this aren't worth a write
+var ZEN_KVA_DEFAULT       = 6      # subscribed power, `ZenConfig {"kva":9}` - persisted
+var ZEN_KVA_MARGIN        = 0.9    # charge only up to 90% of it, house consumption included
+var ZEN_TARIF_POLL_MS     = 60 * 1000
+var ZEN_TARIF_STALE_MS    = 5 * 60 * 1000
+# LiXee private cluster: 0x0000 = PTEC (historique mode, "HC..", "HP..", "HCJB"...),
+# 0x0200 = LTARF (standard mode, supplier label such as "HEURES CREUSES"). Tasmota doesn't
+# name these attributes, they arrive as raw "FF66/xxxx" keys.
+var ZEN_TARIF_KEYS        = ["FF66/0000", "FF66/0200"]
+var ZEN_TARIF_READ_CMD    = '_ZbSend {"Device":"ZLinky","Cluster":"0xFF66","Read":["0x0000","0x0200"]}'
+
 # --- Runtime state (module-level `var` - must be declared before functions that use them,
 #     spec §7 Berry pitfall: file-scope var capture happens at compile time) -------------
 var zen_ip           = ZEN_IP_DEFAULT   # runtime-changeable via `ZenConfig {"ip":"..."}`, persisted
@@ -74,13 +97,21 @@ var zen_export_suspected = false
 var zen_local_loop_enabled = false   # spec §4.5bis: dormant unless ZenPlan sets local_loop:1
 var zen_local_loop_setpoint = 0
 
+var zen_auto_enabled = true   # `ZenConfig {"auto":0|1}`, persisted
+var zen_kva = ZEN_KVA_DEFAULT
+var zen_auto_state = "off"    # off | charge | discharge | capped - for telemetry
+var zen_tarif = nil           # raw tariff label from the ZLinky
+var zen_tarif_ms = 0
+var zen_tarif_poll_ms = 0
+
 var zen_debug = false
 var zen_started_ms = 0
 
 # Pre-declare all top-level functions as globals so they can call each other regardless of
 # textual order (spec §7 Berry pitfall: file-scope name capture happens at compile time -
 # this applies to functions calling each other, not just plain `var` state).
-var zen_clampi, zen_hex_to_wh, zen_now, zen_acmode_window_check, zen_acmode_cap, zen_pub
+var zen_clampi, zen_hex_to_wh, zen_now, zen_acmode_window_check, zen_acmode_cap, zen_acmode_take, zen_pub
+var zen_auto_active, zen_tarif_is_hc, zen_poll_tarif, zen_auto_step, zen_auto_set
 var zen_get, zen_post, zen_flush_pending, zen_apply_write
 var zen_refresh_bounds, zen_clamp_for_mode
 var zen_fallback_state, zen_check_ttl, zen_watchdog
@@ -142,6 +173,16 @@ zen_acmode_cap = def()
     return persist.zen_acmode_cap
   end
   return ZEN_ACMODE_DAILY_CAP_DEFAULT
+end
+
+# Counts one acMode change against the daily cap - false when the cap is already reached.
+zen_acmode_take = def()
+  zen_acmode_window_check()
+  if zen_acmode_count >= zen_acmode_cap() return false end
+  zen_acmode_count += 1
+  persist.zen_acmode_count = zen_acmode_count
+  persist.save()
+  return true
 end
 
 # =========================================================================================
@@ -278,6 +319,13 @@ end
 # =========================================================================================
 
 zen_fallback_state = def(reason)
+  zen_local_loop_enabled = false
+  if zen_auto_enabled && !zen_suspended
+    # Degraded mode is the auto strategy, not idle: it takes over on the next meter sample.
+    # If the meter is silent, zen_check_meter cuts the battery instead.
+    zen_pub("ZENDURE_PLAN_EXPIRED", {"reason": reason, "seq": zen_last_applied_seq, "next": "auto"})
+    return
+  end
   # "acMode inchange, inputLimit = 0, outputLimit = 0" (spec §4.5a)
   zen_apply_write({"inputLimit": 0, "outputLimit": 0}, def(ok, why)
     if !ok tasmota.log("ZEN: fallback write failed: " + why, 2) end
@@ -333,6 +381,8 @@ zen_on_papp = def(value, trigger, msg)
   zen_last_papp_ms = zen_now()
   if zen_local_loop_enabled
     zen_local_loop(value)
+  elif zen_auto_active()
+    zen_auto_step(value)
   end
 end
 
@@ -360,13 +410,109 @@ zen_check_meter = def()
     zen_meter_stale = true
     zen_pub("ZENDURE_METER_STALE", {"age_s": age_s, "out_lim": zen_effective["outputLimit"]})
   end
-  # Discharging blind can export to the grid undetected - cut it. Charging can't export,
-  # so inputLimit is left alone. Re-checked every second, so a discharge plan received
-  # while the meter is still silent gets cut as well.
-  if zen_effective["outputLimit"] > 0
-    zen_apply_write({"outputLimit": 0}, def(ok, why)
+  # Discharging blind can export to the grid undetected - cut it. Re-checked every second,
+  # so a discharge plan received while the meter is still silent gets cut as well.
+  # A cloud plan's charge is left alone (it can't export), but auto mode's charge is cut
+  # too: without the meter it can neither respect the subscribed power nor see the tariff.
+  var props = {}
+  if zen_effective["outputLimit"] > 0 props["outputLimit"] = 0 end
+  if zen_auto_active() && zen_effective["inputLimit"] > 0 props["inputLimit"] = 0 end
+  if size(props) > 0
+    zen_apply_write(props, def(ok, why)
       if !ok tasmota.log("ZEN: meter-stale fallback write failed: " + why, 2) end
     end)
+  end
+end
+
+# =========================================================================================
+# Auto mode - local strategy whenever no cloud plan is active
+# =========================================================================================
+
+zen_auto_active = def()
+  return zen_auto_enabled && !zen_suspended && (zen_plan == nil || zen_plan["expired"])
+end
+
+# true = off-peak, false = peak, nil = unknown (no reading yet, stale, or unrecognized label).
+zen_tarif_is_hc = def()
+  if zen_tarif == nil || (zen_now() - zen_tarif_ms) >= ZEN_TARIF_STALE_MS return nil end
+  var t = string.toupper(zen_tarif)
+  if string.find(t, "HC") >= 0 || string.find(t, "CREUSE") >= 0 return true end
+  if string.find(t, "HP") >= 0 || string.find(t, "PLEINE") >= 0 return false end
+  return nil
+end
+
+zen_poll_tarif = def()
+  if (zen_now() - zen_started_ms) < 15000 return end   # let Zigbee start first
+  if zen_tarif_poll_ms != 0 && (zen_now() - zen_tarif_poll_ms) < ZEN_TARIF_POLL_MS return end
+  zen_tarif_poll_ms = zen_now()
+  tasmota.cmd(ZEN_TARIF_READ_CMD)
+end
+
+# Moves the battery to `acmode` (1 = charge, 2 = discharge) at `watts`, spending an acMode
+# change from the daily cap only when the direction actually flips.
+zen_auto_set = def(acmode, watts)
+  var key = (acmode == 1) ? "inputLimit" : "outputLimit"
+  var other = (acmode == 1) ? "outputLimit" : "inputLimit"
+  var props = {}
+  if zen_effective["acMode"] != acmode
+    if !zen_acmode_take()
+      # Can't flip direction again today - at least stop the current one.
+      if zen_auto_state != "capped"
+        zen_auto_state = "capped"
+        zen_pub("ZENDURE_AUTO", {"state": "capped", "want_acmode": acmode})
+      end
+      if zen_effective["inputLimit"] > 0 || zen_effective["outputLimit"] > 0
+        zen_apply_write({"inputLimit": 0, "outputLimit": 0}, nil)
+      end
+      return
+    end
+    props["acMode"] = acmode
+    props[other] = 0
+    props[key] = watts
+  else
+    var delta = watts - zen_effective[key]
+    if delta < 0 delta = -delta end
+    var deadband = (acmode == 1) ? ZEN_AUTO_IN_DEADBAND_W : 0
+    if delta == 0 || (delta < deadband && watts != 0) return end
+    props[key] = watts
+    if zen_effective[other] != 0 props[other] = 0 end
+  end
+  zen_auto_state = (acmode == 1) ? "charge" : "discharge"
+  zen_apply_write(props, nil)
+end
+
+# Called on every ZLinky apparent-power sample (~10s). Unknown tariff discharges rather than
+# charges: following consumption never imports more than the house needs, while charging
+# blind could run at full power through peak hours.
+zen_auto_step = def(papp)
+  # Don't act on a guessed tariff right after boot - a wrong first guess costs an acMode flip.
+  if zen_tarif == nil && (zen_now() - zen_started_ms) < ZEN_TARIF_POLL_MS return end
+  var acmode = zen_effective["acMode"]
+  if zen_tarif_is_hc() == true
+    # papp includes the current charge, so headroom is what's left under the cap. When
+    # flipping from discharge, the discharge about to stop is hidden consumption: add it back.
+    var cap = zen_clampi(ZEN_AUTO_MAX_IN_W, 0, zen_charge_max)
+    var grid = (acmode == 2) ? papp + zen_effective["outputLimit"] : papp
+    var headroom = int(zen_kva * 1000 * ZEN_KVA_MARGIN) - grid
+    var cur = (acmode == 1) ? zen_effective["inputLimit"] : 0
+    zen_auto_set(1, zen_clampi(cur + headroom, 0, cap))
+  else
+    var cap = zen_clampi(ZEN_AUTO_MAX_OUT_W, 0, zen_output_max)
+    var cur = (acmode == 2) ? zen_effective["outputLimit"] : 0
+    # When flipping from charge, papp still includes the charge about to stop - remove it.
+    if acmode == 1 papp = papp - zen_effective["inputLimit"] end
+    var sp = cur
+    if papp <= 0
+      # Exporting by an unknown amount: halve, so a sudden consumption drop (oven off)
+      # is caught in a few samples instead of a long linear walk down.
+      var down = cur / 2
+      if down < ZEN_AUTO_DOWN_STEP_W down = ZEN_AUTO_DOWN_STEP_W end
+      sp = cur - down
+    else
+      var error = papp - ZEN_AUTO_TARGET_VA
+      if (error < 0 ? -error : error) >= ZEN_AUTO_DEADBAND_VA sp = cur + error end
+    end
+    zen_auto_set(2, zen_clampi(sp, 0, cap))
   end
 end
 
@@ -379,6 +525,15 @@ zen_on_zlinky_full = def(value, trigger, msg)
   # decoded to a friendly name by Tasmota (spec §7: no multiplier/divisor exposed) - it comes
   # back as a raw hex-string keyed by the cluster/attribute id. Match heuristically.
   if msg == nil return end
+  for k: msg.keys()
+    var uk = string.toupper(k)
+    for tk: ZEN_TARIF_KEYS
+      if uk == tk && type(msg[k]) == 'string' && size(msg[k]) > 0
+        zen_tarif = msg[k]
+        zen_tarif_ms = zen_now()
+      end
+    end
+  end
   var raw = nil
   for k: msg.keys()
     if string.find(k, "0702") >= 0
@@ -495,6 +650,7 @@ zen_poll = def()
 
   # A silent ZLinky must read as unknown (-1), never as its last value frozen in time.
   var papp = zen_meter_fresh() ? zen_last_papp : -1
+  var hc = zen_tarif_is_hc()
   var tele = {
     "soc": soc,
     "chg_w": (acmode == 1) ? in_lim : 0,     # setpoint echo, NOT a measurement (spec §7 outputHomePower pitfall)
@@ -508,6 +664,9 @@ zen_poll = def()
     "tmp_dc": tmp,
     "setpoint": (zen_plan != nil && !zen_plan["expired"]) ? zen_plan["watts"] : 0,
     "loop": zen_local_loop_enabled ? 1 : 0,
+    "auto": zen_auto_active() ? zen_auto_state : "off",
+    "tarif": (zen_tarif != nil) ? zen_tarif : "",
+    "hc": (hc == nil) ? -1 : (hc ? 1 : 0),
     "ok": (ok_read == 1 && ok_effect == 1) ? 1 : 0
   }
   zen_pub("ZENDURE", tele)
@@ -594,15 +753,12 @@ zen_cmd_plan = def(cmd, idx, payload, payload_json)
   end
 
   # spec §4.3 rule 3: acMode only changes on charge<->discharge transitions, capped daily.
-  zen_acmode_window_check()
   var acmode_refused = false
   if want_acmode != nil && want_acmode != zen_effective["acMode"]
-    if zen_acmode_count >= zen_acmode_cap()
+    if !zen_acmode_take()
       acmode_refused = true
     else
       props["acMode"] = want_acmode
-      zen_acmode_count += 1
-      persist.zen_acmode_count = zen_acmode_count
       persist.zen_last_applied_seq = seq
       persist.save()
     end
@@ -731,7 +887,22 @@ zen_cmd_config = def(cmd, idx, payload, payload_json)
     persist.zen_topic = zen_topic
     persist.save()
   end
-  tasmota.resp_cmnd_str(json.dump({"ip": zen_ip, "topic": zen_topic}))
+  if pj != nil && pj.find("auto") != nil
+    zen_auto_enabled = (pj["auto"] == 1 || pj["auto"] == true)
+    persist.zen_auto_enabled = zen_auto_enabled
+    persist.save()
+  end
+  if pj != nil && pj.find("kva") != nil
+    var k = pj["kva"]
+    if (type(k) != 'int' && type(k) != 'real') || k < 3 || k > 36
+      tasmota.resp_cmnd_str(json.dump({"applied": 0, "reason": "bad_kva"}))
+      return
+    end
+    zen_kva = k
+    persist.zen_kva = zen_kva
+    persist.save()
+  end
+  tasmota.resp_cmnd_str(json.dump({"ip": zen_ip, "topic": zen_topic, "auto": zen_auto_enabled ? 1 : 0, "kva": zen_kva}))
 end
 
 # =========================================================================================
@@ -760,6 +931,8 @@ class Zendure_Driver
     if persist.has("zen_acmode_window_start_ms") zen_acmode_window_start_ms = persist.zen_acmode_window_start_ms end
     if persist.has("zen_ip") && zen_valid_ip(persist.zen_ip) zen_ip = persist.zen_ip end
     if persist.has("zen_topic") && type(persist.zen_topic) == 'string' && size(persist.zen_topic) > 0 zen_topic = persist.zen_topic end
+    if persist.has("zen_auto_enabled") zen_auto_enabled = persist.zen_auto_enabled end
+    if persist.has("zen_kva") zen_kva = persist.zen_kva end
 
     tasmota.add_cmd("ZenPlan", zen_cmd_plan)
     tasmota.add_cmd("ZenWrite", zen_cmd_write)
@@ -779,6 +952,7 @@ class Zendure_Driver
     zen_check_ttl()
     zen_watchdog()
     zen_check_meter()
+    if zen_auto_enabled zen_poll_tarif() end
   end
 end
 
