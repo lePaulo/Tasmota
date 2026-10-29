@@ -4,7 +4,8 @@
 # This gateway is a SAFE EXECUTOR, not a controller: the control law lives in the cloud
 # backend. Only three things are enforced locally, unconditionally (spec §1 "ce qui reste
 # local"): setpoint expiry (deadman), the daily flash-write cap on acMode, and export/
-# injection detection with fallback to a safe state.
+# injection detection with fallback to a safe state. Discharge is also cut when the ZLinky
+# goes silent, since export detection is blind without it.
 #
 # CONFIRM-ON-FIRST-DEPLOY: the exact JSON key names for live SoC/temperature/power inside
 # `properties`/`packData` were not given by the spec (only the write-side limit properties
@@ -40,6 +41,7 @@ var ZEN_WATCHDOG_MS   = 3600 * 1000   # 1h, spec §4.4 zen_watchdog
 var ZEN_POLL_PERIOD_MS = 30 * 1000
 var ZEN_INJECTION_WINDOW_MS = 10 * 60 * 1000   # spec §4.5bis
 var ZEN_MISMATCH_LIMIT = 3            # spec §4.6
+var ZEN_METER_STALE_MS = 60 * 1000    # ZLinky is polled every 10s - 60s of silence means the meter is gone
 
 # --- Runtime state (module-level `var` - must be declared before functions that use them,
 #     spec §7 Berry pitfall: file-scope var capture happens at compile time) -------------
@@ -64,6 +66,8 @@ var zen_mismatch_count = 0
 var zen_suspended = false
 
 var zen_last_papp = nil
+var zen_last_papp_ms = 0      # when zen_last_papp was received - 0 means never since boot
+var zen_meter_stale = false   # latched so ZENDURE_METER_STALE/OK publish once per transition
 var zen_index_history = []    # [[ms, wh_value], ...] for injection detection
 var zen_export_suspected = false
 
@@ -80,7 +84,7 @@ var zen_clampi, zen_hex_to_wh, zen_now, zen_acmode_window_check, zen_acmode_cap,
 var zen_get, zen_post, zen_flush_pending, zen_apply_write
 var zen_refresh_bounds, zen_clamp_for_mode
 var zen_fallback_state, zen_check_ttl, zen_watchdog
-var zen_local_loop, zen_on_papp, zen_on_zlinky_full
+var zen_local_loop, zen_on_papp, zen_on_zlinky_full, zen_meter_fresh, zen_check_meter
 var zen_check_effect, zen_poll, zen_poll_tick
 var zen_publish_ack, zen_cmd_plan, zen_cmd_write, zen_cmd_state, zen_cmd_debug, zen_cmd_config, zen_valid_ip
 var zen_hello
@@ -291,7 +295,15 @@ zen_check_ttl = def()
 end
 
 zen_watchdog = def()
-  if zen_last_plan_ms == 0 return end   # no plan ever received since boot - nothing to expire
+  if zen_last_plan_ms == 0
+    # No plan since boot: whatever the battery is doing was set before the reboot and its TTL
+    # is unknown - treat it as expired after one default TTL instead of letting it run forever.
+    if (zen_now() - zen_started_ms) >= ZEN_TTL_DEFAULT_S * 1000
+      zen_fallback_state("no_plan_since_boot")
+      zen_last_plan_ms = zen_now()   # hand over to the regular 1h silence watchdog
+    end
+    return
+  end
   if (zen_now() - zen_last_plan_ms) >= ZEN_WATCHDOG_MS
     zen_fallback_state("watchdog_1h_silence")
     zen_last_plan_ms = zen_now()   # avoid re-firing every second while the outage continues
@@ -318,8 +330,43 @@ end
 
 zen_on_papp = def(value, trigger, msg)
   zen_last_papp = value
+  zen_last_papp_ms = zen_now()
   if zen_local_loop_enabled
     zen_local_loop(value)
+  end
+end
+
+# =========================================================================================
+# Meter freshness - the export detector below only runs when ZLinky messages arrive, so a
+# silent meter (unpowered, out of range) would otherwise disable it without any signal.
+# =========================================================================================
+
+zen_meter_fresh = def()
+  return zen_last_papp_ms != 0 && (zen_now() - zen_last_papp_ms) < ZEN_METER_STALE_MS
+end
+
+zen_check_meter = def()
+  # Boot grace: the ZLinky rule polls every 10s, give it a full window before calling it gone.
+  if zen_last_papp_ms == 0 && (zen_now() - zen_started_ms) < ZEN_METER_STALE_MS return end
+  if zen_meter_fresh()
+    if zen_meter_stale
+      zen_meter_stale = false
+      zen_pub("ZENDURE_METER_OK", {"papp": zen_last_papp})
+    end
+    return
+  end
+  var age_s = (zen_last_papp_ms == 0) ? -1 : (zen_now() - zen_last_papp_ms) / 1000
+  if !zen_meter_stale
+    zen_meter_stale = true
+    zen_pub("ZENDURE_METER_STALE", {"age_s": age_s, "out_lim": zen_effective["outputLimit"]})
+  end
+  # Discharging blind can export to the grid undetected - cut it. Charging can't export,
+  # so inputLimit is left alone. Re-checked every second, so a discharge plan received
+  # while the meter is still silent gets cut as well.
+  if zen_effective["outputLimit"] > 0
+    zen_apply_write({"outputLimit": 0}, def(ok, why)
+      if !ok tasmota.log("ZEN: meter-stale fallback write failed: " + why, 2) end
+    end)
   end
 end
 
@@ -424,7 +471,17 @@ zen_poll = def()
       tasmota.log("ZEN raw report: " + body, 3)
       zen_debug = false
     end
-    ok_effect = zen_check_effect(report) ? 1 : 0
+    var rp = report.find("properties")
+    if zen_plan == nil && rp != nil
+      # Nothing commanded since boot: adopt the battery's real state instead of assuming
+      # zeros. Otherwise check_effect flags a bogus mismatch and suspends the driver, and the
+      # export detector/meter guard (gated on outputLimit > 0) stay blind to a live discharge.
+      for k: ["acMode", "inputLimit", "outputLimit"]
+        if rp.find(k) != nil zen_effective[k] = rp[k] end
+      end
+    else
+      ok_effect = zen_check_effect(report) ? 1 : 0
+    end
   else
     ok_read = 0
   end
@@ -436,12 +493,15 @@ zen_poll = def()
   var in_lim = (p != nil && p.find("inputLimit") != nil) ? p["inputLimit"] : zen_effective["inputLimit"]
   var out_lim = (p != nil && p.find("outputLimit") != nil) ? p["outputLimit"] : zen_effective["outputLimit"]
 
+  # A silent ZLinky must read as unknown (-1), never as its last value frozen in time.
+  var papp = zen_meter_fresh() ? zen_last_papp : -1
   var tele = {
     "soc": soc,
     "chg_w": (acmode == 1) ? in_lim : 0,     # setpoint echo, NOT a measurement (spec §7 outputHomePower pitfall)
     "dis_w": (acmode == 2) ? out_lim : 0,
-    "grid_w": (zen_last_papp != nil) ? zen_last_papp : -1,
-    "home_w": (zen_last_papp != nil) ? zen_last_papp : -1,
+    "grid_w": papp,
+    "home_w": papp,
+    "meter_age_s": (zen_last_papp_ms == 0) ? -1 : (zen_now() - zen_last_papp_ms) / 1000,
     "acmode": acmode,
     "in_lim": in_lim,
     "out_lim": out_lim,
@@ -718,6 +778,7 @@ class Zendure_Driver
   def every_second()
     zen_check_ttl()
     zen_watchdog()
+    zen_check_meter()
   end
 end
 
